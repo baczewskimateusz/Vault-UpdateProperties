@@ -1,13 +1,20 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.Remoting.Contexts;
+using System.Security.Cryptography;
 using Autodesk.Connectivity.Explorer.ExtensibilityTools;
 using Autodesk.Connectivity.Extensibility.Framework;
 using Autodesk.Connectivity.JobProcessor.Extensibility;
 using Autodesk.Connectivity.WebServices;
 using Autodesk.Connectivity.WebServicesTools;
 using Autodesk.DataManagement.Client.Framework.Vault.Currency.Connections;
+using Autodesk.DataManagement.Client.Framework.Vault.Currency.Properties;
+using static Autodesk.DataManagement.Client.Framework.Vault.Currency.CopyDesign.PropertyBehavior;
 using ACET = Autodesk.Connectivity.Explorer.ExtensibilityTools;
+using ACW = Autodesk.Connectivity.WebServices;
+
 
 [assembly: ApiVersion("15.0")]
 [assembly: ExtensionId("48a44c92-f5c8-4d70-9a1c-0693073f8cc1")]
@@ -29,7 +36,7 @@ namespace UpdateProperties
         {
             try
             {
-                UpdateFileProperties(context, job);
+                UpdateItemProperties(context, job);
                 return JobOutcome.Success;
             }
             catch (Exception ex)
@@ -59,19 +66,28 @@ namespace UpdateProperties
             //throw new NotImplementedException();
         }
         #endregion IJobHandler Implementation
-        //private void UpdateFileProperties(File file, Dictionary<ACW.PropDef, object> mPropDictonary)
-        private void UpdateFileProperties(IJobProcessorServices context, IJob job)
+        private void UpdateItemProperties(IJobProcessorServices context, IJob job)
         {
             int fileId = int.Parse(job.Params["FileId"]); 
-            Connection vaultCon = context.Connection;
+            Connection vaultConn = context.Connection;
 
-            File file = GetFileById(fileId, vaultCon);
+            File file = GetFileById(fileId, vaultConn);
+            Item item = GetItemByFileId(fileId, vaultConn);
 
-            
-            Dictionary<PropDef,object> changedPropDefDict = new Dictionary<PropDef, object>() ;   
+            List<PropInstParamArray> propInstParamList = GetPropInstParamArray(job,vaultConn);
+            Dictionary<PropDef, object> changedPropDefDict = GetChangedPropDef(job,vaultConn);
 
-            
-            foreach(var jobParam in job.Params)
+            UpdateItem(vaultConn, item, propInstParamList);
+            UpdateFile(vaultConn, file, changedPropDefDict);
+
+
+            AddUpadteItemLinksJob(file.Id, vaultConn);
+
+        }
+        private Dictionary<PropDef, object> GetChangedPropDef(IJob job, Connection vaultCon)
+        {
+            Dictionary<PropDef, object> changedPropDefDict = new Dictionary<PropDef, object>();
+            foreach (var jobParam in job.Params)
             {
                 PropDef propDef = null;
                 if (jobParam.Key != "FileId")
@@ -81,32 +97,182 @@ namespace UpdateProperties
                     changedPropDefDict.Add(propDef, jobParam.Value);
                 }
             }
+            return changedPropDefDict;
 
-            ACET.IExplorerUtil mExplUtil = ExplorerLoader.LoadExplorerUtil(
-            context.Connection.Server, context.Connection.Vault, context.Connection.UserID, context.Connection.Ticket);
+        }
+        private List<PropInstParamArray> GetPropInstParamArray(IJob job, Connection vaultCon)
+        {
+            
+            List<PropInstParam> propInstParamItemsList = new List<PropInstParam>();
+            foreach (var jobParam in job.Params)
+            {
+                PropDef propDef = null;
+                if (jobParam.Key != "FileId")
+                {
+                    string propDefSysName = jobParam.Key;
+                    propDef = GetPropDefBySysName(propDefSysName, vaultCon);
 
-            mExplUtil.UpdateFileProperties(file, changedPropDefDict);
+                    PropInstParam propParam = new PropInstParam();
+                    propParam.PropDefId = propDef.Id;
+                    propParam.Val = jobParam.Value;
+                    propInstParamItemsList.Add(propParam);
 
-            AddJob(fileId, context.Connection);
+                }
+            }
+            List<PropInstParamArray> propInstParamArray = new List<PropInstParamArray>()
+            { 
+                new PropInstParamArray() {
+                    Items= propInstParamItemsList.ToArray()
+                }
+            };
+            List<PropInstParamArray> propInstParamList = new List<PropInstParamArray>()
+            {
+                 new PropInstParamArray() {
+                        Items= propInstParamItemsList.ToArray()
+                 }
+            };
+
+
+            return propInstParamList;
+        }
+
+        private void UpdateItemLinks(IJobProcessorServices context, IJob job, List<PropInstParamArray> propInstParamList)
+        {
+            long fileId = long.Parse(job.Params["FileId"]);
+            Connection vaultConnection = context.Connection;
+            WebServiceManager webServiceManager = vaultConnection.WebServiceManager;
+            ItemService itemService = webServiceManager.ItemService;
+
+            Item item = itemService.GetItemsByFileId(fileId).First();
+
+            try
+            {
+                var linkTypeOptions = ItemFileLnkTypOpt.Primary
+                | ItemFileLnkTypOpt.PrimarySub
+                | ItemFileLnkTypOpt.Secondary
+                | ItemFileLnkTypOpt.SecondarySub
+                | ItemFileLnkTypOpt.StandardComponent
+                | ItemFileLnkTypOpt.Tertiary;
+                var assocs = itemService.GetItemFileAssociationsByItemIds(
+                    new long[] { item.Id }, linkTypeOptions);
+                itemService.AddFilesToPromote(assocs.Select(x => x.CldFileId).ToArray(), ItemAssignAll.No, true);
+                var promoteOrderResults = itemService.GetPromoteComponentOrder(out DateTime timeStamp);
+                if (promoteOrderResults.PrimaryArray != null
+                    && promoteOrderResults.PrimaryArray.Any())
+                {
+                    itemService.PromoteComponents(timeStamp, promoteOrderResults.PrimaryArray);
+                }
+                if (promoteOrderResults.NonPrimaryArray != null
+                    && promoteOrderResults.NonPrimaryArray.Any())
+                {
+                    itemService.PromoteComponentLinks(promoteOrderResults.NonPrimaryArray);
+                }
+                var promoteResult = itemService.GetPromoteComponentsResults(timeStamp);
+
+                Item[] items = promoteResult.ItemRevArray;
+
+                vaultConnection.WebServiceManager.ItemService.UpdateItemProperties(new long[] { item.RevId }, propInstParamList.ToArray());
+
+                itemService.UpdateAndCommitItems(items);
+
+            }
+            catch
+            {
+                itemService.UndoEditItems(new long[] { item.Id });
+                throw;
+            }
 
         }
 
-        private void AddJob(int fileId, Connection vaultCon)
+        private void UpdateItem(Connection vaultConnection, Item item, List<PropInstParamArray> propInstParamList)
         {
-            JobParam[] jobParams = new JobParam[] { };
+            WebServiceManager webServiceManager = vaultConnection.WebServiceManager;
+            ItemService itemService = webServiceManager.ItemService;
 
-            jobParams[0] = new JobParam()
+            try
+            {
+                //var linkTypeOptions = ItemFileLnkTypOpt.Primary
+                //| ItemFileLnkTypOpt.PrimarySub
+                //| ItemFileLnkTypOpt.Secondary
+                //| ItemFileLnkTypOpt.SecondarySub
+                //| ItemFileLnkTypOpt.StandardComponent
+                //| ItemFileLnkTypOpt.Tertiary;
+                //var assocs = itemService.GetItemFileAssociationsByItemIds(
+                //    new long[] { item.Id }, linkTypeOptions);
+                //itemService.AddFilesToPromote(assocs.Select(x => x.CldFileId).ToArray(), ItemAssignAll.No, true);
+                //var promoteOrderResults = itemService.GetPromoteComponentOrder(out DateTime timeStamp);
+                //if (promoteOrderResults.PrimaryArray != null
+                //    && promoteOrderResults.PrimaryArray.Any())
+                //{
+                //    itemService.PromoteComponents(timeStamp, promoteOrderResults.PrimaryArray);
+                //}
+                //if (promoteOrderResults.NonPrimaryArray != null
+                //    && promoteOrderResults.NonPrimaryArray.Any())
+                //{
+                //    itemService.PromoteComponentLinks(promoteOrderResults.NonPrimaryArray);
+                //}
+
+                //var promoteResult = itemService.GetPromoteComponentsResults(timeStamp);
+
+                //Item[] items = promoteResult.ItemRevArray;
+
+                //vaultConnection.WebServiceManager.ItemService.UpdateItemProperties(new long[] { item.RevId }, propInstParamList.ToArray());
+
+                //itemService.UpdateAndCommitItems(items);
+
+                itemService.UpdatePromoteComponents(new long[] { item.RevId },
+                    ItemAssignAll.No, false);
+
+                DateTime timestamp;
+
+                GetPromoteOrderResults promoteOrder =
+
+                    itemService.GetPromoteComponentOrder(out timestamp);
+
+                itemService.PromoteComponents(timestamp, promoteOrder.PrimaryArray);
+
+                ItemsAndFiles itemsAndFiles =
+                    itemService.GetPromoteComponentsResults(timestamp);
+
+
+                vaultConnection.WebServiceManager.ItemService.UpdateItemProperties(new long[] { item.RevId }, propInstParamList.ToArray());
+
+                List<Item> items = itemsAndFiles.ItemRevArray
+                        .Where((x, index) => itemsAndFiles.StatusArray[index] == 4)
+                        .ToList();
+
+                itemService.UpdateAndCommitItems(items.ToArray());
+
+
+            }
+            catch (Exception ex)
+            {
+                itemService.UndoEditItems(new long[] { item.Id });
+                throw ex;
+            }
+        }
+
+        private void UpdateFile(Connection vaultConn, File file, Dictionary<PropDef, object> changedPropDefDict)
+        {
+            ACET.IExplorerUtil mExplUtil = ExplorerLoader.LoadExplorerUtil(
+            vaultConn.Server, vaultConn.Vault, vaultConn.UserID, vaultConn.Ticket);
+            mExplUtil.UpdateFileProperties(file, changedPropDefDict);
+        }
+        private void AddUpadteItemLinksJob(long fileId, Connection vaultCon)
+        {
+            JobParam[] jobParams = new JobParam[]
+            { new JobParam()
             {
                 Name = "FileId",
-                Val = fileId.ToString()
+                    Val = fileId.ToString()
+                }  
             };
-
             File file = GetFileById(fileId, vaultCon);
             vaultCon.WebServiceManager.JobService.AddJob("KRATKI.UpdateItemLinks", $"KRATKI.UpdateItemLinks: {file.Name}", jobParams, 10);
 
         }
 
-        private File GetFileById(int fileId, Connection vaultConnection)
+        private File GetFileById(long fileId, Connection vaultConnection)
         {
             WebServiceManager webServiceManager = vaultConnection.WebServiceManager;
             DocumentService docService = webServiceManager.DocumentService; 
@@ -114,6 +280,16 @@ namespace UpdateProperties
             File file = docService.GetFileById(fileId);
 
             return file;
+        }
+
+        private Item GetItemByFileId(int fileId, Connection vaultConnection)
+        {
+            WebServiceManager webServiceManager = vaultConnection.WebServiceManager;
+            ItemService itemService = webServiceManager.ItemService;
+
+            Item item = itemService.GetItemsByFileId(fileId).First();
+
+            return item;
         }
 
         private PropDef GetPropDefBySysName(string propDefSysName, Connection vaultConnection)
